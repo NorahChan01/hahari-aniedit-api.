@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 3000;
 
 const SOURCES = {
 tiktok: "site:tiktok.com",
-instagram: "site:instagram.com/reel/"
+instagram: "site:instagram.com"
 };
 
 app.get("/", (req, res) => {
@@ -17,17 +17,25 @@ sources: ["tiktok", "instagram"]
 });
 
 async function searchPlatform(platform, query) {
-const searchQuery =
-"${SOURCES[platform]} "${query}" anime edit";
+const searchQuery = "${SOURCES[platform]} "${query}" anime edit";
 
+if (platform === "instagram") {
+// Search specifically for public Instagram Reels and posts.
+// Search-engine indexing may be incomplete.
+return searchWeb(searchQuery, platform);
+}
+
+return searchWeb(searchQuery, platform);
+}
+
+async function searchWeb(searchQuery, platform) {
 const searchUrl =
 "https://html.duckduckgo.com/html/?q=" +
 encodeURIComponent(searchQuery);
 
 const response = await fetch(searchUrl, {
 headers: {
-"User-Agent":
-"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
 },
 signal: AbortSignal.timeout(15000)
 });
@@ -44,48 +52,59 @@ const regex =
 let match;
 
 while ((match = regex.exec(html)) && results.length < 10) {
-let url = match[1];
+let resultUrl = match[1];
 
 try {
-  const parsed = new URL(url, searchUrl);
-  url = parsed.searchParams.get("uddg") || url;
+  const parsed = new URL(resultUrl, searchUrl);
+  resultUrl = parsed.searchParams.get("uddg") || resultUrl;
 } catch {}
 
 try {
-  url = decodeURIComponent(url);
+  resultUrl = decodeURIComponent(resultUrl);
 } catch {}
 
-let parsed;
+let parsedUrl;
 
 try {
-  parsed = new URL(url);
+  parsedUrl = new URL(resultUrl);
 } catch {
   continue;
 }
 
-const host = parsed.hostname.toLowerCase();
+if (parsedUrl.protocol !== "https:") continue;
 
-const valid = platform === "tiktok"
-  ? host === "tiktok.com" || host.endsWith(".tiktok.com")
-  : (host === "instagram.com" ||
-     host.endsWith(".instagram.com")) &&
-    /^\/(reel|p)\//.test(parsed.pathname);
+const host = parsedUrl.hostname.toLowerCase();
 
-if (!valid || parsed.protocol !== "https:") continue;
+const isTikTok =
+  host === "tiktok.com" || host.endsWith(".tiktok.com");
+
+const isInstagram =
+  host === "instagram.com" || host.endsWith(".instagram.com");
+
+if (platform === "tiktok" && !isTikTok) continue;
+if (platform === "instagram" && !isInstagram) continue;
+
+if (
+  platform === "instagram" &&
+  !/^\/(reel|reels|p)\//.test(parsedUrl.pathname)
+) {
+  continue;
+}
+
+if (results.some(item => item.url === parsedUrl.href)) continue;
 
 const title = match[2]
   .replace(/<[^>]*>/g, "")
   .replace(/&amp;/g, "&")
   .replace(/&quot;/g, '"')
+  .replace(/&#39;/g, "'")
   .trim();
 
-if (!results.some(item => item.url === parsed.href)) {
-  results.push({
-    platform,
-    title,
-    url: parsed.href
-  });
-}
+results.push({
+  platform,
+  title,
+  url: parsedUrl.href
+});
 
 }
 
@@ -110,9 +129,8 @@ error: "Source must be all, tiktok, or instagram."
 });
 }
 
-const platforms = source === "all"
-? ["tiktok", "instagram"]
-: [source];
+const platforms =
+source === "all" ? ["tiktok", "instagram"] : [source];
 
 const settled = await Promise.allSettled(
 platforms.map(platform => searchPlatform(platform, query))
@@ -133,7 +151,7 @@ error: item.reason.message
 });
 
 res.json({
-success: true,
+success: errors.length < platforms.length,
 query,
 source,
 count: results.length,
@@ -143,5 +161,5 @@ errors
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-console.log("Hahari Anime Edit API running on ${PORT}");
+console.log("Hahari Anime Edit API running on port ${PORT}");
 });
