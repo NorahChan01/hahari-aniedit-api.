@@ -1,7 +1,23 @@
 const express = require("express");
+const youtubedl = require("youtube-dl-exec");
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const os = require("node:os");
+const crypto = require("node:crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+
+const DOWNLOAD_DIR = path.join(
+  os.tmpdir(),
+  "hahari-aniedit-downloads"
+);
+
+fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
 const ENGINES = [
   {
@@ -26,6 +42,10 @@ const ENGINES = [
   }
 ];
 
+let activeDownloads = 0;
+const MAX_CONCURRENT_DOWNLOADS = 1;
+const MAX_VIDEO_BYTES = 20 * 1024 * 1024;
+
 function decodeHtml(value) {
   return String(value || "")
     .replace(/&amp;/gi, "&")
@@ -43,7 +63,7 @@ function getAttribute(tag, name) {
   let pos = lower.indexOf(key);
 
   while (pos !== -1) {
-    if (pos === 0 || /[\s]/.test(tag[pos - 1])) {
+    if (pos === 0 || /\s/.test(tag[pos - 1])) {
       let start = pos + key.length;
       const quote = tag[start];
 
@@ -54,10 +74,10 @@ function getAttribute(tag, name) {
       }
 
       let end = start;
-      while (
-        end < tag.length &&
-        !/[\s>]/.test(tag[end])
-      ) end++;
+
+      while (end < tag.length && !/[\s>]/.test(tag[end])) {
+        end++;
+      }
 
       return tag.slice(start, end);
     }
@@ -140,6 +160,7 @@ function parseAnchors(html, base, platform) {
     if (tagEnd === -1) break;
 
     const close = html.toLowerCase().indexOf("</a>", tagEnd);
+
     if (close === -1) {
       position = tagEnd + 1;
       continue;
@@ -147,6 +168,7 @@ function parseAnchors(html, base, platform) {
 
     const tag = html.slice(start, tagEnd + 1);
     const content = html.slice(tagEnd + 1, close);
+
     position = close + 4;
 
     const rawUrl = getAttribute(tag, "href");
@@ -156,7 +178,7 @@ function parseAnchors(html, base, platform) {
     if (!parsed) continue;
 
     const host = parsed.hostname.toLowerCase();
-    const path = parsed.pathname.toLowerCase();
+    const urlPath = parsed.pathname.toLowerCase();
 
     const isTikTok =
       host === "tiktok.com" || host.endsWith(".tiktok.com");
@@ -168,15 +190,15 @@ function parseAnchors(html, base, platform) {
     if (platform === "tiktok" && !isTikTok) continue;
     if (platform === "instagram" && !isInstagram) continue;
 
-    if (platform === "tiktok" && !path.includes("/video/")) {
+    if (platform === "tiktok" && !urlPath.includes("/video/")) {
       continue;
     }
 
     if (
       platform === "instagram" &&
-      !path.startsWith("/reel/") &&
-      !path.startsWith("/reels/") &&
-      !path.startsWith("/p/")
+      !urlPath.startsWith("/reel/") &&
+      !urlPath.startsWith("/reels/") &&
+      !urlPath.startsWith("/p/")
     ) {
       continue;
     }
@@ -186,11 +208,9 @@ function parseAnchors(html, base, platform) {
 
     if (results.some(item => item.url === finalUrl)) continue;
 
-    const title = cleanText(content) || "Anime edit video";
-
     results.push({
       platform,
-      title: title.slice(0, 250),
+      title: (cleanText(content) || "Anime edit video").slice(0, 250),
       url: finalUrl
     });
 
@@ -209,7 +229,7 @@ async function searchEngine(engine, query, platform) {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
         "AppleWebKit/537.36 (KHTML, like Gecko) " +
         "Chrome/131.0.0.0 Safari/537.36",
-      "Accept":
+      Accept:
         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.9"
     },
@@ -238,8 +258,7 @@ async function searchPlatform(platform, query) {
       ? "site:tiktok.com"
       : "site:instagram.com";
 
-  const searchQuery =
-    site + " " + query + " anime edit";
+  const searchQuery = site + " " + query + " anime edit";
 
   const attempts = await Promise.allSettled(
     ENGINES.map(engine =>
@@ -268,16 +287,66 @@ async function searchPlatform(platform, query) {
   return { results, errors };
 }
 
+function validateVideoUrl(value) {
+  let parsed;
+
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== "https:") return null;
+
+  const host = parsed.hostname.toLowerCase();
+  const urlPath = parsed.pathname.toLowerCase();
+
+  const isTikTok =
+    host === "tiktok.com" || host.endsWith(".tiktok.com");
+
+  const isInstagram =
+    host === "instagram.com" ||
+    host.endsWith(".instagram.com");
+
+  if (isTikTok && urlPath.includes("/video/")) {
+    return { url: parsed.href, platform: "tiktok" };
+  }
+
+  if (
+    isInstagram &&
+    (urlPath.startsWith("/reel/") ||
+      urlPath.startsWith("/reels/") ||
+      urlPath.startsWith("/p/"))
+  ) {
+    return { url: parsed.href, platform: "instagram" };
+  }
+
+  return null;
+}
+
+async function removeDownloadFiles(id) {
+  try {
+    const names = await fsp.readdir(DOWNLOAD_DIR);
+
+    await Promise.all(
+      names
+        .filter(name => name.startsWith(id + "."))
+        .map(name =>
+          fsp.unlink(path.join(DOWNLOAD_DIR, name)).catch(() => {})
+        )
+    );
+  } catch {}
+}
+
 app.get("/", (req, res) => {
   res.json({
     name: "Hahari Anime Edit API",
     status: "online",
-    searchMethod: "Free public search engines",
     paidApiKeysRequired: false,
     endpoints: {
       search: "/api/search?q=gojo&source=all",
-      tiktok: "/api/search?q=gojo&source=tiktok",
-      instagram: "/api/search?q=gojo&source=instagram"
+      download:
+        "/api/download?url=ENCODED_PUBLIC_TIKTOK_OR_INSTAGRAM_URL"
     }
   });
 });
@@ -335,6 +404,131 @@ app.get("/api/search", async (req, res) => {
       success: false,
       error: error.message
     });
+  }
+});
+
+app.get("/api/download", async (req, res) => {
+  const inputUrl = String(req.query.url || "");
+  const validated = validateVideoUrl(inputUrl);
+
+  if (!validated) {
+    return res.status(400).json({
+      success: false,
+      error:
+        "Provide a valid public TikTok video or Instagram Reel URL."
+    });
+  }
+
+  if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
+    return res.status(429).json({
+      success: false,
+      error: "A download is already running. Try again shortly."
+    });
+  }
+
+  activeDownloads++;
+
+  const id = crypto.randomBytes(12).toString("hex");
+  const outputTemplate = path.join(
+    DOWNLOAD_DIR,
+    id + ".%(ext)s"
+  );
+
+  try {
+    await youtubedl(
+      validated.url,
+      {
+        noPlaylist: true,
+        noWarnings: true,
+        noProgress: true,
+        format: "best[ext=mp4]/best",
+        output: outputTemplate,
+        maxFilesize: "20M",
+        socketTimeout: 20,
+        retries: 1
+      },
+      {
+        timeout: 65000
+      }
+    );
+
+    const names = await fsp.readdir(DOWNLOAD_DIR);
+
+    const candidates = names.filter(name =>
+      name.startsWith(id + ".") &&
+      !name.endsWith(".part")
+    );
+
+    if (!candidates.length) {
+      throw new Error("The platform did not provide a downloadable video.");
+    }
+
+    const filePath = path.join(DOWNLOAD_DIR, candidates[0]);
+    const stats = await fsp.stat(filePath);
+
+    if (!stats.isFile() || stats.size === 0) {
+      throw new Error("The downloaded file is empty.");
+    }
+
+    if (stats.size > MAX_VIDEO_BYTES) {
+      throw new Error("The video exceeds the 20 MB download limit.");
+    }
+
+    const extension = path.extname(filePath).toLowerCase();
+
+    res.setHeader("Content-Length", stats.size);
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="hahari-anime-edit' +
+        (extension || ".mp4") +
+        '"'
+    );
+
+    res.setHeader(
+      "Content-Type",
+      extension === ".webm" ? "video/webm" : "video/mp4"
+    );
+
+    const stream = fs.createReadStream(filePath);
+
+    stream.on("error", async error => {
+      console.error("Video stream error:", error.message);
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          error: "Could not stream the downloaded video."
+        });
+      } else {
+        res.destroy(error);
+      }
+    });
+
+    stream.on("close", () => {
+      removeDownloadFiles(id);
+    });
+
+    res.on("close", () => {
+      removeDownloadFiles(id);
+    });
+
+    stream.pipe(res);
+  } catch (error) {
+    await removeDownloadFiles(id);
+
+    console.error("Download failed:", error.message);
+
+    if (!res.headersSent) {
+      res.status(502).json({
+        success: false,
+        platform: validated.platform,
+        error:
+          "Download failed. The platform may block the server, " +
+          "the video may be private, or the video may be unavailable."
+      });
+    }
+  } finally {
+    activeDownloads--;
   }
 });
 
