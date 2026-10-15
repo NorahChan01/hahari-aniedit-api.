@@ -17,31 +17,22 @@ sources: ["tiktok", "instagram"]
 });
 
 async function searchPlatform(platform, query) {
-const searchQuery = "${SOURCES[platform]} "${query}" anime edit";
+const searchQuery =
+SOURCES[platform] + ' "' + query + '" anime edit';
 
-if (platform === "instagram") {
-// Search specifically for public Instagram Reels and posts.
-// Search-engine indexing may be incomplete.
-return searchWeb(searchQuery, platform);
-}
-
-return searchWeb(searchQuery, platform);
-}
-
-async function searchWeb(searchQuery, platform) {
 const searchUrl =
 "https://html.duckduckgo.com/html/?q=" +
 encodeURIComponent(searchQuery);
 
 const response = await fetch(searchUrl, {
 headers: {
-"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+"User-Agent": "Mozilla/5.0"
 },
 signal: AbortSignal.timeout(15000)
 });
 
 if (!response.ok) {
-throw new Error("Search provider returned HTTP ${response.status}");
+throw new Error("Search provider returned HTTP " + response.status);
 }
 
 const html = await response.text();
@@ -87,9 +78,7 @@ if (platform === "instagram" && !isInstagram) continue;
 if (
   platform === "instagram" &&
   !/^\/(reel|reels|p)\//.test(parsedUrl.pathname)
-) {
-  continue;
-}
+) continue;
 
 if (results.some(item => item.url === parsedUrl.href)) continue;
 
@@ -101,8 +90,8 @@ const title = match[2]
   .trim();
 
 results.push({
-  platform,
-  title,
+  platform: platform,
+  title: title,
   url: parsedUrl.href
 });
 
@@ -118,7 +107,7 @@ const source = String(req.query.source || "all").toLowerCase();
 if (!query || query.length > 150) {
 return res.status(400).json({
 success: false,
-error: "Provide a search query between 1 and 150 characters."
+error: "Provide a query between 1 and 150 characters."
 });
 }
 
@@ -152,14 +141,14 @@ error: item.reason.message
 
 res.json({
 success: errors.length < platforms.length,
-query,
-source,
+query: query,
+source: source,
 count: results.length,
-results,
-errors
+results: results,
+errors: errors
 });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-console.log("Hahari Anime Edit API running on port ${PORT}");
+console.log("Hahari Anime Edit API running on port " + PORT);
 });
