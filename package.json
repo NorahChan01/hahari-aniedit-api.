@@ -7,7 +7,6 @@
 "start": "node index.js"
 },
 "dependencies": {
-"express": "^5.1.0",
-"yt-dlp-exec": "^1.0.2"
+"express": "^5.1.0"
 }
 }
