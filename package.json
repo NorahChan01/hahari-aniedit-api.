@@ -1,0 +1,13 @@
+{
+"name": "hahari-aniedit-api",
+"version": "1.0.0",
+"description": "Hahari Anime Edit Search and Video API",
+"main": "index.js",
+"scripts": {
+"start": "node index.js"
+},
+"dependencies": {
+"express": "^5.1.0",
+"yt-dlp-exec": "^1.0.2"
+}
+}
