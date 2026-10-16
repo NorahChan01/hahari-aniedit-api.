@@ -9,11 +9,18 @@ const MAX_CACHE_SIZE = 200;
 const MAX_PAGE = 11;
 const BATCH_SIZE = 9;
 
+const EXCLUDE =
+  /\b(recommendations?|recap|reviews?|reviewing|explained|explanation|commentary|commentator|reactions?|reacting|discussion|analysis|breakdown|news|podcasts?|interviews?|watch[\s-]?along|ranking|tier[\s-]?lists?|top\s+\d+|ending\s+explained|story\s+explained|character\s+analysis|episode\s+review|manga\s+review|first\s+impressions|why\s+you\s+should\s+watch|must[\s-]?watch|underrated\s+anime|overrated\s+anime)\b/i;
+
+const EDIT =
+  /\b(amv|anime[\s_-]*edits?|animeedit|velocity[\s_-]*edit|phonk[\s_-]*edit|fancams?|character[\s_-]*edits?|4k[\s_-]*edit|60fps[\s_-]*edit|twix(tor)?|after[\s_-]*effects|capcut[\s_-]*edit|anime[\s_-]*edit[\s_-]*audio|edit[\s_-]*audio)\b/i;
+
 app.get("/", (req, res) => {
   res.json({
     name: "Hahari Instagram Anime Edit API",
     status: "online",
     endpoint: "/api/search?q=alya",
+    refreshEndpoint: "/api/search?q=alya&refresh=1&page=2",
     batchSize: BATCH_SIZE,
     maxPage: MAX_PAGE
   });
@@ -32,7 +39,11 @@ app.get("/api/search", async (req, res) => {
     });
   }
 
-  if (!Number.isInteger(page) || page < 1 || page > MAX_PAGE) {
+  if (
+    !Number.isInteger(page) ||
+    page < 1 ||
+    page > MAX_PAGE
+  ) {
     return res.status(400).json({
       success: false,
       error: `Page must be between 1 and ${MAX_PAGE}`
@@ -59,7 +70,11 @@ app.get("/api/search", async (req, res) => {
       "https://api.scrapecreators.com/v2/instagram/reels/search"
     );
 
-    url.searchParams.set("query", `${query} anime edit AMV`);
+    // Search for the requested character and edit-related content.
+    url.searchParams.set(
+      "query",
+      `${query} anime edit AMV`
+    );
     url.searchParams.set("page", String(page));
 
     const response = await fetch(url, {
@@ -75,37 +90,59 @@ app.get("/api/search", async (req, res) => {
     if (!response.ok) {
       return res.status(response.status).json({
         success: false,
-        error: data.message || data.error || "Instagram search failed"
+        error:
+          data.message ||
+          data.error ||
+          "Instagram search failed"
       });
     }
 
-    const reels = Array.isArray(data.reels) ? data.reels : [];
+    const reels = Array.isArray(data.reels)
+      ? data.reels
+      : [];
+
     const seen = new Set();
     const results = [];
 
     for (const item of reels) {
       const video = item.video_url;
+      const caption = String(item.caption || "").trim();
 
       if (
         typeof video !== "string" ||
         !/^https?:\/\//i.test(video) ||
-        item.is_video === false ||
-        seen.has(video)
+        item.is_video === false
       ) {
+        continue;
+      }
+
+      // Remove recommendation, commentary, and reaction content.
+      if (EXCLUDE.test(caption)) {
+        continue;
+      }
+
+      // Require an identifiable edit or AMV signal.
+      if (!EDIT.test(caption)) {
+        continue;
+      }
+
+      if (seen.has(video)) {
         continue;
       }
 
       seen.add(video);
 
       results.push({
-        title: String(item.caption || `${query} Anime Edit`)
+        title: caption
           .replace(/\s+/g, " ")
           .trim()
-          .slice(0, 200),
+          .slice(0, 200) || `${query} Anime Edit`,
         video
       });
 
-      if (results.length >= BATCH_SIZE) break;
+      if (results.length >= BATCH_SIZE) {
+        break;
+      }
     }
 
     const output = {
@@ -127,6 +164,7 @@ app.get("/api/search", async (req, res) => {
 
     res.set("X-Cache", refresh ? "REFRESHED" : "MISS");
     return res.json(output);
+
   } catch (error) {
     console.error("[API SEARCH ERROR]", error.message);
 
@@ -138,5 +176,7 @@ app.get("/api/search", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Hahari Instagram Anime Edit API running on ${PORT}`);
+  console.log(
+    `Hahari Instagram Anime Edit API running on ${PORT}`
+  );
 });
