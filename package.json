@@ -1,6 +1,6 @@
 {
   "name": "hahari-aniedit-api",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Free Hahari Anime Edit Search API",
   "main": "index.js",
   "scripts": {
