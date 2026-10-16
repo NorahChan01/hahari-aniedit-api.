@@ -1,5 +1,4 @@
 const express = require("express");
-const youtubedl = require("youtube-dl-exec");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -7,25 +6,106 @@ const PORT = process.env.PORT || 10000;
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
-const SEARCH_TIMEOUT = 8000;
+const TIMEOUT_MS = 7000;
 const MAX_RESULTS = 20;
 
-const SEARCH_ENGINES = [
+// Public, key-free search sources. Availability can change.
+const SEARCH_SOURCES = [
+  {
+    name: "searx",
+    url: "https://searx.tiekoetter.com/search",
+    format: "json",
+  },
+  {
+    name: "searx",
+    url: "https://search.sapti.me/search",
+    format: "json",
+  },
   {
     name: "google",
-    url: (q) =>
-      "https://www.google.com/search?q=" +
-      encodeURIComponent(q) +
-      "&num=20",
+    url: "https://www.google.com/search",
+    format: "html",
   },
   {
     name: "bing",
-    url: (q) =>
-      "https://www.bing.com/search?q=" +
-      encodeURIComponent(q) +
-      "&count=20",
+    url: "https://www.bing.com/search",
+    format: "html",
   },
 ];
+
+function platformOf(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.toLowerCase();
+
+    if (
+      host === "tiktok.com" ||
+      host.endsWith(".tiktok.com")
+    ) {
+      return "tiktok";
+    }
+
+    if (
+      host === "instagram.com" ||
+      host.endsWith(".instagram.com")
+    ) {
+      return "instagram";
+    }
+  } catch {}
+
+  return null;
+}
+
+function isVideoUrl(rawUrl, platform) {
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.toLowerCase();
+
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      return false;
+    }
+
+    if (platform === "tiktok") {
+      return (
+        (host === "tiktok.com" || host.endsWith(".tiktok.com")) &&
+        /\/@[^/]+\/video\/\d+/i.test(url.pathname)
+      );
+    }
+
+    if (platform === "instagram") {
+      return (
+        (host === "instagram.com" ||
+          host.endsWith(".instagram.com")) &&
+        /^\/(reel|reels|p)\/[^/]+/i.test(url.pathname)
+      );
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+
+    if (
+      url.protocol !== "https:" &&
+      url.protocol !== "http:"
+    ) {
+      return null;
+    }
+
+    url.search = "";
+    url.hash = "";
+    url.hostname = url.hostname.toLowerCase();
+
+    return url.href.replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
 
 function decodeHtml(value = "") {
   return String(value)
@@ -43,150 +123,98 @@ function decodeHtml(value = "") {
 }
 
 function cleanText(value = "") {
-  return decodeHtml(
-    String(value)
-      .replace(/<script[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style[\s\S]*?<\/style>/gi, " ")
-      .replace(/<[^>]+>/g, " ")
-  )
+  return decodeHtml(String(value))
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function unwrapUrl(rawUrl = "") {
+async function fetchText(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
   try {
-    let url = decodeHtml(rawUrl);
+    const response = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        Accept:
+          "application/json,text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
 
-    if (url.startsWith("//")) {
-      url = "https:" + url;
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
 
-    const parsed = new URL(url, "https://www.google.com");
-
-    if (parsed.pathname === "/url") {
-      url =
-        parsed.searchParams.get("q") ||
-        parsed.searchParams.get("url") ||
-        url;
-    } else if (parsed.hostname.includes("bing.com")) {
-      url = parsed.searchParams.get("u") || url;
-
-      if (url.startsWith("a1")) {
-        try {
-          url = Buffer.from(url.slice(2), "base64").toString();
-        } catch {}
-      }
-    }
-
-    if (url.startsWith("//")) {
-      url = "https:" + url;
-    }
-
-    const result = new URL(url);
-
-    if (!["http:", "https:"].includes(result.protocol)) {
-      return null;
-    }
-
-    return result.href;
-  } catch {
-    return null;
+    return await response.text();
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-function identifyPlatform(url) {
-  try {
-    const host = new URL(url).hostname.toLowerCase();
-
-    if (
-      host === "tiktok.com" ||
-      host.endsWith(".tiktok.com")
-    ) {
-      return "tiktok";
-    }
-
-    if (
-      host === "instagram.com" ||
-      host.endsWith(".instagram.com")
-    ) {
-      return "instagram";
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function isValidVideoPage(url, platform) {
-  try {
-    const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
-
-    if (platform === "tiktok") {
-      return (
-        (host === "tiktok.com" ||
-          host.endsWith(".tiktok.com")) &&
-        /\/@[^/]+\/video\/\d+/i.test(parsed.pathname)
-      );
-    }
-
-    if (platform === "instagram") {
-      return (
-        (host === "instagram.com" ||
-          host.endsWith(".instagram.com")) &&
-        /^\/(reel|reels|p)\/[^/]+/i.test(parsed.pathname)
-      );
-    }
-
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-function parseSearchResults(html, platform) {
+function extractHtmlLinks(html, platform) {
   const results = [];
   const seen = new Set();
 
-  const anchors =
-    html.match(/<a\b[^>]*>[\s\S]*?<\/a>/gi) || [];
+  // Extract URLs from href attributes, even when result markup changes.
+  const matches =
+    html.matchAll(/\bhref\s*=\s*["']([^"']+)["']/gi);
 
-  for (const anchor of anchors) {
-    const hrefMatch = anchor.match(
-      /\bhref\s*=\s*["']([^"']+)["']/i
-    );
+  for (const match of matches) {
+    let raw = decodeHtml(match[1]);
 
-    if (!hrefMatch) continue;
+    try {
+      if (raw.startsWith("//")) raw = "https:" + raw;
 
-    const url = unwrapUrl(hrefMatch[1]);
+      const base = new URL(raw, "https://www.google.com");
 
-    if (!url || !isValidVideoPage(url, platform)) continue;
+      if (
+        base.hostname.includes("google.com") &&
+        base.pathname === "/url"
+      ) {
+        raw =
+          base.searchParams.get("q") ||
+          base.searchParams.get("url") ||
+          raw;
+      } else if (
+        base.hostname.includes("bing.com") &&
+        base.pathname === "/ck/a"
+      ) {
+        const encoded = base.searchParams.get("u");
 
-    const normalized = url.split("?")[0].replace(/\/$/, "");
-
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-
-    const titleMatch = anchor.match(
-      /<h[1-6]\b[^>]*>([\s\S]*?)<\/h[1-6]>/i
-    );
-
-    let title = titleMatch
-      ? cleanText(titleMatch[1])
-      : cleanText(anchor);
-
-    if (!title || title.length < 3) {
-      title =
-        platform === "tiktok"
-          ? "TikTok anime edit"
-          : "Instagram anime edit";
+        if (encoded?.startsWith("a1")) {
+          raw = Buffer.from(encoded.slice(2), "base64").toString();
+        }
+      }
+    } catch {
+      continue;
     }
 
+    const actualPlatform = platformOf(raw);
+
+    if (!actualPlatform) continue;
+    if (platform !== "all" && actualPlatform !== platform) continue;
+    if (!isVideoUrl(raw, actualPlatform)) continue;
+
+    const url = normalizeUrl(raw);
+
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+
     results.push({
-      title: title.slice(0, 250),
-      url: normalized,
-      platform,
+      title:
+        actualPlatform === "tiktok"
+          ? "TikTok video"
+          : "Instagram reel",
+      url,
+      platform: actualPlatform,
     });
 
     if (results.length >= MAX_RESULTS) break;
@@ -195,81 +223,73 @@ function parseSearchResults(html, platform) {
   return results;
 }
 
-async function fetchWithTimeout(url) {
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    SEARCH_TIMEOUT
-  );
+function extractJsonResults(data, platform) {
+  const items = Array.isArray(data.results) ? data.results : [];
+  const results = [];
 
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-          "AppleWebKit/537.36 (KHTML, like Gecko) " +
-          "Chrome/131.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-      },
+  for (const item of items) {
+    const rawUrl = item.url || item.link;
+
+    if (!rawUrl) continue;
+
+    const actualPlatform = platformOf(rawUrl);
+
+    if (!actualPlatform) continue;
+    if (platform !== "all" && actualPlatform !== platform) continue;
+    if (!isVideoUrl(rawUrl, actualPlatform)) continue;
+
+    results.push({
+      title: cleanText(item.title || "Anime edit").slice(0, 250),
+      url: normalizeUrl(rawUrl),
+      platform: actualPlatform,
+      description: cleanText(item.content || item.description || "")
+        .slice(0, 500),
     });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    const html = await response.text();
-
-    if (
-      /unusual traffic|captcha|verify you are human|access denied/i.test(
-        html.slice(0, 15000)
-      )
-    ) {
-      throw new Error("Search engine blocked this request");
-    }
-
-    return html;
-  } finally {
-    clearTimeout(timer);
   }
+
+  return results.filter((item) => item.url);
 }
 
-async function searchEngine(engine, query, platform) {
-  const site =
+async function searchSource(source, query, platform) {
+  const siteQuery =
     platform === "all"
-      ? "(site:tiktok.com OR site:instagram.com)"
-      : `site:${platform}.com`;
+      ? `(site:tiktok.com OR site:instagram.com) "${query}" anime edit`
+      : `site:${platform}.com "${query}" anime edit`;
 
-  const searchQuery =
-    `${site} "${query}" anime edit`;
+  const url = new URL(source.url);
+  url.searchParams.set("q", siteQuery);
 
-  const html = await fetchWithTimeout(
-    engine.url(searchQuery)
-  );
-
-  if (platform === "all") {
-    return [
-      ...parseSearchResults(html, "tiktok"),
-      ...parseSearchResults(html, "instagram"),
-    ];
+  if (source.format === "json") {
+    url.searchParams.set("format", "json");
+    url.searchParams.set("language", "en");
+    url.searchParams.set("safesearch", "0");
   }
 
-  return parseSearchResults(html, platform);
+  const body = await fetchText(url.href);
+
+  if (source.format === "json") {
+    let data;
+
+    try {
+      data = JSON.parse(body);
+    } catch {
+      throw new Error("Search source returned invalid JSON");
+    }
+
+    return extractJsonResults(data, platform);
+  }
+
+  return extractHtmlLinks(body, platform);
 }
 
 app.get("/", (req, res) => {
   res.json({
-    name: "Hahari Anime Edit API",
+    name: "Hahari Anime Edit Search API",
     status: "online",
     paidApiKeysRequired: false,
     endpoints: {
-      search: "/api/search?q=gojo&source=all",
-      download:
-        "/api/download?url=ENCODED_PUBLIC_TIKTOK_OR_INSTAGRAM_URL",
+      search: "/api/search?q=gojo&source=tiktok",
+      supportedSources: ["tiktok", "instagram", "all"],
     },
   });
 });
@@ -281,135 +301,80 @@ app.get("/api/search", async (req, res) => {
   if (!query) {
     return res.status(400).json({
       success: false,
-      error: "Missing search query. Use ?q=gojo",
-    });
-  }
-
-  if (!["all", "tiktok", "instagram"].includes(source)) {
-    return res.status(400).json({
-      success: false,
-      error: "Source must be all, tiktok, or instagram",
+      error: "Missing query. Example: /api/search?q=gojo",
     });
   }
 
   if (query.length > 150) {
     return res.status(400).json({
       success: false,
-      error: "Search query is too long",
+      error: "Query must be 150 characters or fewer.",
     });
   }
 
-  const platforms =
-    source === "all" ? ["tiktok", "instagram"] : [source];
+  if (!["all", "tiktok", "instagram"].includes(source)) {
+    return res.status(400).json({
+      success: false,
+      error: "source must be tiktok, instagram, or all.",
+    });
+  }
 
-  const tasks = SEARCH_ENGINES.map(async (engine) => {
-    const output = [];
+  const results = [];
+  const seen = new Set();
+  const errors = [];
 
-    for (const platform of platforms) {
-      try {
-        const results = await searchEngine(
-          engine,
-          query,
-          platform
-        );
+  // Query every source concurrently to avoid sequential delays.
+  const attempts = await Promise.allSettled(
+    SEARCH_SOURCES.map(async (searchSource) => ({
+      engine: searchSource.name,
+      items: await searchSource(searchSource, query, source),
+    }))
+  );
 
-        output.push(...results);
-      } catch (error) {
-        console.error(
-          `Search ${engine.name}/${platform}:`,
-          error.message
-        );
-      }
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    const engine = SEARCH_SOURCES[i].name;
+
+    if (attempt.status === "rejected") {
+      errors.push({
+        engine,
+        error:
+          attempt.reason?.name === "AbortError"
+            ? "Request timed out"
+            : String(attempt.reason?.message || "Search failed"),
+      });
+      continue;
     }
 
-    return output;
-  });
+    for (const item of attempt.value.items) {
+      if (!item.url || seen.has(item.url)) continue;
 
-  const batches = await Promise.allSettled(tasks);
-  const combined = [];
-  const seen = new Set();
-
-  for (const batch of batches) {
-    if (batch.status !== "fulfilled") continue;
-
-    for (const item of batch.value) {
-      if (seen.has(item.url)) continue;
       seen.add(item.url);
-      combined.push(item);
+      results.push(item);
     }
   }
 
   res.json({
-    success: combined.length > 0,
+    success: results.length > 0,
     query,
     source,
-    count: combined.length,
-    results: combined.slice(0, MAX_RESULTS),
+    count: Math.min(results.length, MAX_RESULTS),
+    results: results.slice(0, MAX_RESULTS),
+    errors,
     note:
-      combined.length > 0
-        ? "Search completed"
-        : "No results found. Google and Bing may block requests from this server or have no indexed matches.",
+      results.length > 0
+        ? "Search completed."
+        : "No matching public video links found. Check errors; public search services may be blocked or unavailable.",
   });
 });
 
-app.get("/api/download", async (req, res) => {
-  const url = String(req.query.url || "").trim();
-  const platform = identifyPlatform(url);
-
-  if (!url || !platform) {
-    return res.status(400).json({
-      success: false,
-      error:
-        "Provide a public TikTok or Instagram video URL.",
-    });
-  }
-
-  if (!isValidVideoPage(url, platform)) {
-    return res.status(400).json({
-      success: false,
-      platform,
-      error: "The URL is not a supported video page.",
-    });
-  }
-
-  try {
-    const info = await youtubedl(url, {
-      dumpSingleJson: true,
-      noWarnings: true,
-      noCallHome: true,
-      noPlaylist: true,
-      format: "best[ext=mp4]/best",
-      socketTimeout: 20,
-      retries: 1,
-    });
-
-    const downloadUrl = info.url;
-
-    if (!downloadUrl) {
-      throw new Error("No direct video URL returned");
-    }
-
-    res.json({
-      success: true,
-      platform,
-      title: info.title || "Anime edit",
-      downloadUrl,
-      url: downloadUrl,
-      thumbnail: info.thumbnail || null,
-      duration: info.duration || null,
-    });
-  } catch (error) {
-    console.error("Download failed:", error.message);
-
-    res.status(502).json({
-      success: false,
-      platform,
-      error:
-        "Download failed. The platform may block the server, or the video may be private or unavailable.",
-    });
-  }
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: "Endpoint not found.",
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Hahari Anime Edit API listening on port ${PORT}`);
+  console.log(`Hahari Anime Edit Search API running on port ${PORT}`);
 });
