@@ -3,6 +3,9 @@ const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+const cache = new Map();
+const CACHE_TTL = 5 * 60 * 1000;
+
 const EXCLUDE =
   /\b(commentary|commentating|reacts?|reaction|review|explained|news|podcast|interview|discussion|analysis|breakdown|trailer|watch along)\b/i;
 
@@ -35,6 +38,15 @@ app.get("/api/search", async (req, res) => {
     });
   }
 
+  const cacheKey = query.toLowerCase();
+
+  const cached = cache.get(cacheKey);
+
+  if (cached && Date.now() < cached.expiresAt) {
+    res.set("X-Cache", "HIT");
+    return res.json(cached.data);
+  }
+
   try {
     const url = new URL(
       "https://api.scrapecreators.com/v2/instagram/reels/search"
@@ -44,7 +56,6 @@ app.get("/api/search", async (req, res) => {
       "query",
       `${query} anime edit AMV #animeedit`
     );
-
     url.searchParams.set("page", "1");
 
     const response = await fetch(url, {
@@ -69,17 +80,16 @@ app.get("/api/search", async (req, res) => {
     const results = reels
       .filter(item => {
         const caption = String(item.caption || "");
-        const text = caption.toLowerCase();
 
         if (!item.video_url || item.is_video === false) {
           return false;
         }
 
-        if (EXCLUDE.test(text)) {
+        if (EXCLUDE.test(caption)) {
           return false;
         }
 
-        return EDIT.test(text);
+        return EDIT.test(caption);
       })
       .map(item => ({
         title: String(item.caption || `${query} anime edit`)
@@ -89,14 +99,28 @@ app.get("/api/search", async (req, res) => {
         video: item.video_url
       }));
 
-    res.json({
+    const output = {
       success: true,
       query,
       count: results.length,
       results
+    };
+
+    cache.set(cacheKey, {
+      data: output,
+      expiresAt: Date.now() + CACHE_TTL
     });
+
+    // Prevent unlimited cache growth.
+    if (cache.size > 200) {
+      const oldestKey = cache.keys().next().value;
+      cache.delete(oldestKey);
+    }
+
+    res.set("X-Cache", "MISS");
+    return res.json(output);
   } catch (error) {
-    res.status(502).json({
+    return res.status(502).json({
       success: false,
       error: error.message
     });
