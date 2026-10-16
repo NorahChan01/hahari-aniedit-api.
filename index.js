@@ -12,31 +12,30 @@ app.get("/", (req, res) => {
   res.json({
     name: "Hahari Anime Edit API",
     status: "online",
-    sources: ["tiktok", "instagram"],
-    endpoints: {
-      search: "/api/search?q=gojo&source=tiktok",
-      all: "/api/search?q=gojo&source=all"
-    }
+    sources: ["tiktok", "instagram"]
   });
 });
 
-function cleanText(text) {
-  return text
-    .replace(/<[^>]*>/g, "")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#(\d+);/g, (_, n) =>
-      String.fromCodePoint(Number(n))
-    )
-    .replace(/&nbsp;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+async function searchSource(platform, query) {
+  const searchQuery = `${SOURCES[platform]} ${query} anime edit`;
+  const url =
+    "https://html.duckduckgo.com/html/?q=" +
+    encodeURIComponent(searchQuery);
 
-function extractResults(html, platform, searchUrl) {
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml",
+      "Accept-Language": "en-US,en;q=0.9"
+    },
+    signal: AbortSignal.timeout(20000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`DuckDuckGo returned HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
   const results = [];
   const seen = new Set();
 
@@ -46,105 +45,120 @@ function extractResults(html, platform, searchUrl) {
   let match;
 
   while ((match = regex.exec(html)) && results.length < 10) {
-    let videoUrl = cleanText(match[1]);
+    let link = match[1];
 
     try {
-      const parsed = new URL(videoUrl, searchUrl);
-      const redirect =
+      const parsed = new URL(link, url);
+      link =
         parsed.searchParams.get("uddg") ||
-        parsed.searchParams.get("url");
-
-      if (redirect) videoUrl = redirect;
-    } catch {
-      continue;
-    }
-
-    try {
-      videoUrl = decodeURIComponent(videoUrl);
+        parsed.searchParams.get("url") ||
+        link;
     } catch {}
 
-    let parsedUrl;
+    try {
+      link = decodeURIComponent(link);
+    } catch {}
+
+    let parsed;
 
     try {
-      parsedUrl = new URL(videoUrl);
+      parsed = new URL(link);
     } catch {
       continue;
     }
 
-    const host = parsedUrl.hostname.toLowerCase();
+    const host = parsed.hostname.toLowerCase();
 
     const isTikTok =
-      host === "tiktok.com" ||
-      host.endsWith(".tiktok.com");
+      host === "tiktok.com" || host.endsWith(".tiktok.com");
 
     const isInstagram =
-      host === "instagram.com" ||
-      host.endsWith(".instagram.com");
-
-    if (
-      parsedUrl.protocol !== "https:" &&
-      parsedUrl.protocol !== "http:"
-    ) {
-      continue;
-    }
+      host === "instagram.com" || host.endsWith(".instagram.com");
 
     if (platform === "tiktok" && !isTikTok) continue;
 
     if (
       platform === "instagram" &&
-      (!isInstagram || !/^\/(reel|reels|p)\//i.test(parsedUrl.pathname))
-    ) {
-      continue;
-    }
+      (!isInstagram || !/^\/(reel|reels|p)\//i.test(parsed.pathname))
+    ) continue;
 
-    parsedUrl.search = "";
-    parsedUrl.hash = "";
+    if (!["http:", "https:"].includes(parsed.protocol)) continue;
 
-    const finalUrl = parsedUrl.href.replace(/\/$/, "");
+    parsed.search = "";
+    parsed.hash = "";
+    const cleanUrl = parsed.href.replace(/\/$/, "");
 
-    if (seen.has(finalUrl)) continue;
-    seen.add(finalUrl);
+    if (seen.has(cleanUrl)) continue;
+    seen.add(cleanUrl);
 
     results.push({
       platform,
-      title: cleanText(match[2]) || "Anime edit",
-      url: finalUrl
+      title: match[2]
+        .replace(/<[^>]*>/g, "")
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .trim(),
+      url: cleanUrl
     });
   }
 
-  return results;
-}
+  // If the HTML layout changes, try DuckDuckGo's redirect-link format.
+  if (results.length === 0) {
+    const fallbackRegex =
+      /href=["']([^"']*(?:tiktok\.com|instagram\.com)[^"']*)["']/gi;
 
-async function searchSource(platform, query) {
-  const searchQuery = `${SOURCES[platform]} ${query} anime edit`;
+    while ((match = fallbackRegex.exec(html)) && results.length < 10) {
+      let link = match[1].replace(/&amp;/g, "&");
 
-  const url =
-    "https://html.duckduckgo.com/html/?q=" +
-    encodeURIComponent(searchQuery);
+      try {
+        const parsed = new URL(link, url);
+        link = parsed.searchParams.get("uddg") || link;
+      } catch {}
 
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-      "Accept":
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9"
-    },
-    signal: AbortSignal.timeout(15000)
-  });
+      try {
+        link = decodeURIComponent(link);
+      } catch {}
 
-  if (!response.ok) {
-    throw new Error(`Search provider returned HTTP ${response.status}`);
+      let parsed;
+
+      try {
+        parsed = new URL(link);
+      } catch {
+        continue;
+      }
+
+      const host = parsed.hostname.toLowerCase();
+      const isTikTok =
+        host === "tiktok.com" || host.endsWith(".tiktok.com");
+      const isInstagram =
+        host === "instagram.com" || host.endsWith(".instagram.com");
+
+      if (platform === "tiktok" && !isTikTok) continue;
+      if (platform === "instagram" && !isInstagram) continue;
+      if (!["http:", "https:"].includes(parsed.protocol)) continue;
+
+      if (
+        platform === "instagram" &&
+        !/^\/(reel|reels|p)\//i.test(parsed.pathname)
+      ) continue;
+
+      parsed.search = "";
+      parsed.hash = "";
+      const cleanUrl = parsed.href.replace(/\/$/, "");
+
+      if (seen.has(cleanUrl)) continue;
+      seen.add(cleanUrl);
+
+      results.push({
+        platform,
+        title: "Anime edit",
+        url: cleanUrl
+      });
+    }
   }
 
-  const html = await response.text();
-  const results = extractResults(html, platform, url);
-
-  return {
-    platform,
-    count: results.length,
-    results
-  };
+  return { platform, results };
 }
 
 app.get("/api/search", async (req, res) => {
@@ -155,13 +169,6 @@ app.get("/api/search", async (req, res) => {
     return res.status(400).json({
       success: false,
       error: "Provide a search query using ?q=gojo"
-    });
-  }
-
-  if (query.length > 200) {
-    return res.status(400).json({
-      success: false,
-      error: "Search query must be 200 characters or fewer."
     });
   }
 
@@ -182,22 +189,19 @@ app.get("/api/search", async (req, res) => {
   const results = [];
   const errors = [];
 
-  for (let i = 0; i < settled.length; i++) {
-    const item = settled[i];
-    const platform = platforms[i];
-
+  settled.forEach((item, index) => {
     if (item.status === "fulfilled") {
       results.push(...item.value.results);
     } else {
       errors.push({
-        platform,
+        platform: platforms[index],
         error: item.reason?.message || "Search failed"
       });
     }
-  }
+  });
 
   res.json({
-    success: results.length > 0 || errors.length === 0,
+    success: errors.length === 0 && results.length > 0,
     query,
     source,
     count: results.length,
