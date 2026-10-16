@@ -1,7 +1,7 @@
 {
-  "name": "hahari-aniedit-api",
-  "version": "3.0.0",
-  "description": "Free Hahari Anime Edit Search API",
+  "name": "hahari-instagram-edit-api",
+  "version": "1.0.0",
+  "description": "Instagram Anime Edit Search API",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
