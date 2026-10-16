@@ -9,15 +9,14 @@ app.use(express.json({ limit: "1mb" }));
 const TIMEOUT_MS = 7000;
 const MAX_RESULTS = 20;
 
-// Public, key-free search sources. Availability can change.
 const SEARCH_SOURCES = [
   {
-    name: "searx",
+    name: "searx-tiekoetter",
     url: "https://searx.tiekoetter.com/search",
     format: "json",
   },
   {
-    name: "searx",
+    name: "searx-sapt ime",
     url: "https://search.sapti.me/search",
     format: "json",
   },
@@ -35,13 +34,9 @@ const SEARCH_SOURCES = [
 
 function platformOf(rawUrl) {
   try {
-    const url = new URL(rawUrl);
-    const host = url.hostname.toLowerCase();
+    const host = new URL(rawUrl).hostname.toLowerCase();
 
-    if (
-      host === "tiktok.com" ||
-      host.endsWith(".tiktok.com")
-    ) {
+    if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
       return "tiktok";
     }
 
@@ -61,7 +56,7 @@ function isVideoUrl(rawUrl, platform) {
     const url = new URL(rawUrl);
     const host = url.hostname.toLowerCase();
 
-    if (url.protocol !== "https:" && url.protocol !== "http:") {
+    if (!["https:", "http:"].includes(url.protocol)) {
       return false;
     }
 
@@ -90,10 +85,7 @@ function normalizeUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
 
-    if (
-      url.protocol !== "https:" &&
-      url.protocol !== "http:"
-    ) {
+    if (!["https:", "http:"].includes(url.protocol)) {
       return null;
     }
 
@@ -141,8 +133,9 @@ async function fetchText(url) {
       redirect: "follow",
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+          "AppleWebKit/537.36 (KHTML, like Gecko) " +
+          "Chrome/131.0.0.0 Safari/537.36",
         Accept:
           "application/json,text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
@@ -163,31 +156,33 @@ function extractHtmlLinks(html, platform) {
   const results = [];
   const seen = new Set();
 
-  // Extract URLs from href attributes, even when result markup changes.
-  const matches =
-    html.matchAll(/\bhref\s*=\s*["']([^"']+)["']/gi);
+  const matches = html.matchAll(
+    /\bhref\s*=\s*["']([^"']+)["']/gi
+  );
 
   for (const match of matches) {
     let raw = decodeHtml(match[1]);
 
     try {
-      if (raw.startsWith("//")) raw = "https:" + raw;
+      if (raw.startsWith("//")) {
+        raw = "https:" + raw;
+      }
 
-      const base = new URL(raw, "https://www.google.com");
+      const parsed = new URL(raw, "https://www.google.com");
 
       if (
-        base.hostname.includes("google.com") &&
-        base.pathname === "/url"
+        parsed.hostname.includes("google.com") &&
+        parsed.pathname === "/url"
       ) {
         raw =
-          base.searchParams.get("q") ||
-          base.searchParams.get("url") ||
+          parsed.searchParams.get("q") ||
+          parsed.searchParams.get("url") ||
           raw;
       } else if (
-        base.hostname.includes("bing.com") &&
-        base.pathname === "/ck/a"
+        parsed.hostname.includes("bing.com") &&
+        parsed.pathname === "/ck/a"
       ) {
-        const encoded = base.searchParams.get("u");
+        const encoded = parsed.searchParams.get("u");
 
         if (encoded?.startsWith("a1")) {
           raw = Buffer.from(encoded.slice(2), "base64").toString();
@@ -206,6 +201,7 @@ function extractHtmlLinks(html, platform) {
     const url = normalizeUrl(raw);
 
     if (!url || seen.has(url)) continue;
+
     seen.add(url);
 
     results.push({
@@ -238,28 +234,33 @@ function extractJsonResults(data, platform) {
     if (platform !== "all" && actualPlatform !== platform) continue;
     if (!isVideoUrl(rawUrl, actualPlatform)) continue;
 
+    const url = normalizeUrl(rawUrl);
+
+    if (!url) continue;
+
     results.push({
       title: cleanText(item.title || "Anime edit").slice(0, 250),
-      url: normalizeUrl(rawUrl),
+      url,
       platform: actualPlatform,
-      description: cleanText(item.content || item.description || "")
-        .slice(0, 500),
+      description: cleanText(
+        item.content || item.description || ""
+      ).slice(0, 500),
     });
   }
 
-  return results.filter((item) => item.url);
+  return results;
 }
 
-async function searchSource(source, query, platform) {
+async function searchSource(engine, query, platform) {
   const siteQuery =
     platform === "all"
       ? `(site:tiktok.com OR site:instagram.com) "${query}" anime edit`
       : `site:${platform}.com "${query}" anime edit`;
 
-  const url = new URL(source.url);
+  const url = new URL(engine.url);
   url.searchParams.set("q", siteQuery);
 
-  if (source.format === "json") {
+  if (engine.format === "json") {
     url.searchParams.set("format", "json");
     url.searchParams.set("language", "en");
     url.searchParams.set("safesearch", "0");
@@ -267,7 +268,7 @@ async function searchSource(source, query, platform) {
 
   const body = await fetchText(url.href);
 
-  if (source.format === "json") {
+  if (engine.format === "json") {
     let data;
 
     try {
@@ -319,17 +320,16 @@ app.get("/api/search", async (req, res) => {
     });
   }
 
+  const attempts = await Promise.allSettled(
+    SEARCH_SOURCES.map(async (engine) => ({
+      engine: engine.name,
+      items: await searchSource(engine, query, source),
+    }))
+  );
+
   const results = [];
   const seen = new Set();
   const errors = [];
-
-  // Query every source concurrently to avoid sequential delays.
-  const attempts = await Promise.allSettled(
-    SEARCH_SOURCES.map(async (searchSource) => ({
-      engine: searchSource.name,
-      items: await searchSource(searchSource, query, source),
-    }))
-  );
 
   for (let i = 0; i < attempts.length; i++) {
     const attempt = attempts[i];
@@ -341,7 +341,9 @@ app.get("/api/search", async (req, res) => {
         error:
           attempt.reason?.name === "AbortError"
             ? "Request timed out"
-            : String(attempt.reason?.message || "Search failed"),
+            : String(
+                attempt.reason?.message || "Search failed"
+              ),
       });
       continue;
     }
@@ -376,5 +378,7 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Hahari Anime Edit Search API running on port ${PORT}`);
+  console.log(
+    `Hahari Anime Edit Search API running on port ${PORT}`
+  );
 });
