@@ -17,72 +17,72 @@ app.get("/api/search", async (req, res) => {
   if (!query) {
     return res.status(400).json({
       success: false,
-      error: "Enter a search term using ?q=naruto"
+      error: "Provide a search term using ?q=naruto"
+    });
+  }
+
+  const apiKey = process.env.SCRAPECREATORS_API_KEY;
+
+  if (!apiKey) {
+    return res.status(500).json({
+      success: false,
+      error: "Missing SCRAPECREATORS_API_KEY environment variable"
     });
   }
 
   try {
-    const searchUrl =
-      "https://www.google.com/search?q=" +
-      encodeURIComponent(
-        `site:instagram.com/reel/ OR site:instagram.com/p/ ${query} anime edit`
-      );
+    const url = new URL(
+      "https://api.scrapecreators.com/v2/instagram/reels/search"
+    );
+    url.searchParams.set("query", query);
 
-    const response = await fetch(searchUrl, {
+    const response = await fetch(url, {
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9"
+        "x-api-key": apiKey,
+        "Accept": "application/json"
       },
-      signal: AbortSignal.timeout(20000)
+      signal: AbortSignal.timeout(25000)
     });
 
+    const data = await response.json();
+
     if (!response.ok) {
-      throw new Error(`Google search returned HTTP ${response.status}`);
-    }
-
-    const html = await response.text();
-    const results = [];
-    const seen = new Set();
-
-    const regex =
-      /https?:\\?\/\\?\/(?:www\.)?instagram\.com\\?\/(reel|reels|p)\\?\/([A-Za-z0-9_-]+)/gi;
-
-    let match;
-
-    while ((match = regex.exec(html)) && results.length < 20) {
-      const url = `https://www.instagram.com/${match[1]}/${match[2]}/`;
-
-      if (seen.has(url)) continue;
-      seen.add(url);
-
-      results.push({
-        platform: "instagram",
-        title: `${query} anime edit`,
-        url
+      return res.status(response.status).json({
+        success: false,
+        query,
+        error: data.message || data.error || "Instagram search provider failed",
+        details: data
       });
     }
 
+    const items = Array.isArray(data)
+      ? data
+      : data.reels || data.results || data.data || data.items || [];
+
+    const results = items
+      .map(item => ({
+        platform: "instagram",
+        title: item.caption || item.title || `${query} anime edit`,
+        url: item.url || item.permalink || item.share_url ||
+          item.shortcode_url || "",
+        videoUrl: item.video_url || item.videoUrl || null
+      }))
+      .filter(item =>
+        typeof item.url === "string" &&
+        /^https?:\/\/(www\.)?instagram\.com\//i.test(item.url)
+      );
+
     res.json({
-      success: results.length > 0,
+      success: true,
       query,
       source: "instagram",
       count: results.length,
-      results,
-      ...(results.length === 0
-        ? {
-            message:
-              "No Instagram edit links found. The search provider may block automated requests."
-          }
-        : {})
+      results
     });
   } catch (error) {
     res.status(502).json({
       success: false,
       query,
-      source: "instagram",
-      count: 0,
-      results: [],
       error: error.message
     });
   }
