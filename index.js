@@ -1,219 +1,264 @@
 const express = require("express");
 const youtubedl = require("youtube-dl-exec");
-const fs = require("node:fs");
-const fsp = require("node:fs/promises");
-const path = require("node:path");
-const os = require("node:os");
-const crypto = require("node:crypto");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 app.disable("x-powered-by");
-app.set("trust proxy", 1);
+app.use(express.json({ limit: "1mb" }));
 
-const DOWNLOAD_DIR = path.join(os.tmpdir(), "hahari-aniedit-downloads");
-fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+const SEARCH_TIMEOUT = 8000;
+const MAX_RESULTS = 20;
 
-const MAX_CONCURRENT_DOWNLOADS = 1;
-const MAX_VIDEO_BYTES = 20 * 1024 * 1024;
-let activeDownloads = 0;
-
-const ENGINES = [
+const SEARCH_ENGINES = [
   {
     name: "google",
-    url: q => `https://www.google.com/search?q=${encodeURIComponent(q)}&num=20`
+    url: (q) =>
+      "https://www.google.com/search?q=" +
+      encodeURIComponent(q) +
+      "&num=20",
   },
   {
     name: "bing",
-    url: q => `https://www.bing.com/search?q=${encodeURIComponent(q)}&count=20`
+    url: (q) =>
+      "https://www.bing.com/search?q=" +
+      encodeURIComponent(q) +
+      "&count=20",
   },
-  {
-    name: "duckduckgo",
-    url: q => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`
-  }
 ];
 
-function decodeHtml(value) {
-  return String(value || "")
+function decodeHtml(value = "") {
+  return String(value)
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&#x27;/gi, "'")
+    .replace(/&#39;|&apos;/gi, "'")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)));
+    .replace(/&#(\d+);/g, (_, n) =>
+      String.fromCodePoint(Number(n))
+    )
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) =>
+      String.fromCodePoint(parseInt(n, 16))
+    );
 }
 
-function cleanText(html) {
-  return decodeHtml(String(html || "")
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]*>/g, " "))
+function cleanText(value = "") {
+  return decodeHtml(
+    String(value)
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  )
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function getAttribute(tag, name) {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = tag.match(new RegExp("\\b" + escaped + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", "i"));
-  return match ? (match[1] || match[2] || match[3] || "") : "";
-}
-
-function unwrapUrl(value, base) {
+function unwrapUrl(rawUrl = "") {
   try {
-    let url = decodeHtml(value);
-    let parsed = new URL(url, base);
+    let url = decodeHtml(rawUrl);
 
-    for (const key of ["uddg", "url", "q"]) {
-      const target = parsed.searchParams.get(key);
-      if (target && /^https?:\/\//i.test(target)) {
-        url = target;
-        break;
+    if (url.startsWith("//")) {
+      url = "https:" + url;
+    }
+
+    const parsed = new URL(url, "https://www.google.com");
+
+    if (parsed.pathname === "/url") {
+      url =
+        parsed.searchParams.get("q") ||
+        parsed.searchParams.get("url") ||
+        url;
+    } else if (parsed.hostname.includes("bing.com")) {
+      url = parsed.searchParams.get("u") || url;
+
+      if (url.startsWith("a1")) {
+        try {
+          url = Buffer.from(url.slice(2), "base64").toString();
+        } catch {}
       }
     }
 
-    parsed = new URL(url, base);
+    if (url.startsWith("//")) {
+      url = "https:" + url;
+    }
 
-    if (parsed.protocol !== "https:") return null;
+    const result = new URL(url);
 
-    const host = parsed.hostname.toLowerCase();
-    if (
-      host === "google.com" || host.endsWith(".google.com") ||
-      host === "bing.com" || host.endsWith(".bing.com") ||
-      host === "duckduckgo.com" || host.endsWith(".duckduckgo.com")
-    ) return null;
+    if (!["http:", "https:"].includes(result.protocol)) {
+      return null;
+    }
 
-    return parsed;
+    return result.href;
   } catch {
     return null;
   }
 }
 
-function platformForHost(host) {
-  if (host === "tiktok.com" || host.endsWith(".tiktok.com")) return "tiktok";
-  if (host === "instagram.com" || host.endsWith(".instagram.com")) return "instagram";
-  return null;
-}
+function identifyPlatform(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
 
-function isVideoPath(platform, pathname) {
-  const p = pathname.toLowerCase();
+    if (
+      host === "tiktok.com" ||
+      host.endsWith(".tiktok.com")
+    ) {
+      return "tiktok";
+    }
 
-  if (platform === "tiktok") return /\/video\/\d+/.test(p);
-  if (platform === "instagram") {
-    return /^\/(reel|reels|p)\/[^/]+/.test(p);
+    if (
+      host === "instagram.com" ||
+      host.endsWith(".instagram.com")
+    ) {
+      return "instagram";
+    }
+
+    return null;
+  } catch {
+    return null;
   }
-
-  return false;
 }
 
-function parseAnchors(html, base, requestedPlatform) {
+function isValidVideoPage(url, platform) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+
+    if (platform === "tiktok") {
+      return (
+        (host === "tiktok.com" ||
+          host.endsWith(".tiktok.com")) &&
+        /\/@[^/]+\/video\/\d+/i.test(parsed.pathname)
+      );
+    }
+
+    if (platform === "instagram") {
+      return (
+        (host === "instagram.com" ||
+          host.endsWith(".instagram.com")) &&
+        /^\/(reel|reels|p)\/[^/]+/i.test(parsed.pathname)
+      );
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function parseSearchResults(html, platform) {
   const results = [];
   const seen = new Set();
 
-  // Search engines commonly place titles and links inside <a> elements.
-  const anchors = String(html || "").match(/<a\b[^>]*>[\s\S]*?<\/a>/gi) || [];
+  const anchors =
+    html.match(/<a\b[^>]*>[\s\S]*?<\/a>/gi) || [];
 
   for (const anchor of anchors) {
-    const openTag = anchor.match(/^<a\b[^>]*>/i)?.[0] || "";
-    const rawUrl = getAttribute(openTag, "href");
-    if (!rawUrl) continue;
+    const hrefMatch = anchor.match(
+      /\bhref\s*=\s*["']([^"']+)["']/i
+    );
 
-    const parsed = unwrapUrl(rawUrl, base);
-    if (!parsed) continue;
+    if (!hrefMatch) continue;
 
-    const platform = platformForHost(parsed.hostname.toLowerCase());
-    if (!platform || (requestedPlatform !== "all" && platform !== requestedPlatform)) continue;
-    if (!isVideoPath(platform, parsed.pathname)) continue;
+    const url = unwrapUrl(hrefMatch[1]);
 
-    parsed.hash = "";
-    parsed.search = "";
-    const url = parsed.href.replace(/\/$/, "");
-    if (seen.has(url)) continue;
-    seen.add(url);
+    if (!url || !isValidVideoPage(url, platform)) continue;
 
-    const title = cleanText(anchor).slice(0, 250) || "Anime edit video";
-    results.push({ platform, title, url });
+    const normalized = url.split("?")[0].replace(/\/$/, "");
 
-    if (results.length >= 15) break;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+
+    const titleMatch = anchor.match(
+      /<h[1-6]\b[^>]*>([\s\S]*?)<\/h[1-6]>/i
+    );
+
+    let title = titleMatch
+      ? cleanText(titleMatch[1])
+      : cleanText(anchor);
+
+    if (!title || title.length < 3) {
+      title =
+        platform === "tiktok"
+          ? "TikTok anime edit"
+          : "Instagram anime edit";
+    }
+
+    results.push({
+      title: title.slice(0, 250),
+      url: normalized,
+      platform,
+    });
+
+    if (results.length >= MAX_RESULTS) break;
   }
 
   return results;
+}
+
+async function fetchWithTimeout(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(),
+    SEARCH_TIMEOUT
+  );
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+          "AppleWebKit/537.36 (KHTML, like Gecko) " +
+          "Chrome/131.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const html = await response.text();
+
+    if (
+      /unusual traffic|captcha|verify you are human|access denied/i.test(
+        html.slice(0, 15000)
+      )
+    ) {
+      throw new Error("Search engine blocked this request");
+    }
+
+    return html;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function searchEngine(engine, query, platform) {
-  const url = engine.url(query);
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml",
-      "Accept-Language": "en-US,en;q=0.8"
-    },
-    signal: AbortSignal.timeout(10000)
-  });
+  const site =
+    platform === "all"
+      ? "(site:tiktok.com OR site:instagram.com)"
+      : `site:${platform}.com`;
 
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const searchQuery =
+    `${site} "${query}" anime edit`;
 
-  const html = await response.text();
-  if (/captcha|unusual traffic|before you continue|verify you are human/i.test(html)) {
-    throw new Error("Search engine returned a block or consent page");
-  }
-
-  const results = parseAnchors(html, url, platform);
-  if (!results.length && html.length < 1000) {
-    throw new Error("Search engine returned an unexpected response");
-  }
-  return results;
-}
-
-async function searchPlatform(platform, query) {
-  const siteQuery = platform === "all"
-    ? `(${ "site:tiktok.com OR site:instagram.com" }) "${query}" anime edit`
-    : `site:${platform}.com "${query}" anime edit`;
-
-  const attempts = await Promise.allSettled(
-    ENGINES.map(engine => searchEngine(engine, siteQuery, platform))
+  const html = await fetchWithTimeout(
+    engine.url(searchQuery)
   );
 
-  const results = [];
-  const errors = [];
-
-  attempts.forEach((attempt, index) => {
-    if (attempt.status === "rejected") {
-      errors.push({ engine: ENGINES[index].name, error: String(attempt.reason?.message || attempt.reason) });
-      return;
-    }
-
-    for (const result of attempt.value) {
-      if (!results.some(item => item.url === result.url)) results.push(result);
-    }
-  });
-
-  return { results, errors };
-}
-
-function validateVideoUrl(value) {
-  try {
-    const parsed = new URL(value);
-    if (parsed.protocol !== "https:") return null;
-
-    const platform = platformForHost(parsed.hostname.toLowerCase());
-    if (!platform || !isVideoPath(platform, parsed.pathname)) return null;
-
-    return { url: parsed.href, platform };
-  } catch {
-    return null;
+  if (platform === "all") {
+    return [
+      ...parseSearchResults(html, "tiktok"),
+      ...parseSearchResults(html, "instagram"),
+    ];
   }
-}
 
-async function removeDownloadFiles(id) {
-  try {
-    const names = await fsp.readdir(DOWNLOAD_DIR);
-    await Promise.all(names
-      .filter(name => name.startsWith(id + "."))
-      .map(name => fsp.unlink(path.join(DOWNLOAD_DIR, name)).catch(() => {})));
-  } catch {}
+  return parseSearchResults(html, platform);
 }
 
 app.get("/", (req, res) => {
@@ -223,8 +268,9 @@ app.get("/", (req, res) => {
     paidApiKeysRequired: false,
     endpoints: {
       search: "/api/search?q=gojo&source=all",
-      download: "/api/download?url=ENCODED_PUBLIC_TIKTOK_OR_INSTAGRAM_URL"
-    }
+      download:
+        "/api/download?url=ENCODED_PUBLIC_TIKTOK_OR_INSTAGRAM_URL",
+    },
   });
 });
 
@@ -232,107 +278,138 @@ app.get("/api/search", async (req, res) => {
   const query = String(req.query.q || "").trim();
   const source = String(req.query.source || "all").toLowerCase();
 
-  if (!query || query.length > 100) {
-    return res.status(400).json({ success: false, error: "Enter a query between 1 and 100 characters." });
-  }
-  if (!["all", "tiktok", "instagram"].includes(source)) {
-    return res.status(400).json({ success: false, error: "Source must be all, tiktok, or instagram." });
-  }
-
-  try {
-    const platforms = source === "all" ? ["tiktok", "instagram"] : [source];
-    const responses = await Promise.all(platforms.map(async platform => ({
-      platform,
-      ...(await searchPlatform(platform, query))
-    })));
-
-    const results = responses.flatMap(item => item.results).slice(0, 20);
-    const errors = responses.flatMap(item => item.errors.map(error => ({ platform: item.platform, ...error })));
-
-    res.json({
-      success: results.length > 0,
-      query,
-      source,
-      count: results.length,
-      results,
-      errors,
-      note: results.length
-        ? "Results are public links, not downloaded videos."
-        : "No results found. Check errors for blocked engines or try a different query."
+  if (!query) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing search query. Use ?q=gojo",
     });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
   }
+
+  if (!["all", "tiktok", "instagram"].includes(source)) {
+    return res.status(400).json({
+      success: false,
+      error: "Source must be all, tiktok, or instagram",
+    });
+  }
+
+  if (query.length > 150) {
+    return res.status(400).json({
+      success: false,
+      error: "Search query is too long",
+    });
+  }
+
+  const platforms =
+    source === "all" ? ["tiktok", "instagram"] : [source];
+
+  const tasks = SEARCH_ENGINES.map(async (engine) => {
+    const output = [];
+
+    for (const platform of platforms) {
+      try {
+        const results = await searchEngine(
+          engine,
+          query,
+          platform
+        );
+
+        output.push(...results);
+      } catch (error) {
+        console.error(
+          `Search ${engine.name}/${platform}:`,
+          error.message
+        );
+      }
+    }
+
+    return output;
+  });
+
+  const batches = await Promise.allSettled(tasks);
+  const combined = [];
+  const seen = new Set();
+
+  for (const batch of batches) {
+    if (batch.status !== "fulfilled") continue;
+
+    for (const item of batch.value) {
+      if (seen.has(item.url)) continue;
+      seen.add(item.url);
+      combined.push(item);
+    }
+  }
+
+  res.json({
+    success: combined.length > 0,
+    query,
+    source,
+    count: combined.length,
+    results: combined.slice(0, MAX_RESULTS),
+    note:
+      combined.length > 0
+        ? "Search completed"
+        : "No results found. Google and Bing may block requests from this server or have no indexed matches.",
+  });
 });
 
 app.get("/api/download", async (req, res) => {
-  const validated = validateVideoUrl(String(req.query.url || ""));
+  const url = String(req.query.url || "").trim();
+  const platform = identifyPlatform(url);
 
-  if (!validated) {
+  if (!url || !platform) {
     return res.status(400).json({
       success: false,
-      error: "Provide a valid public TikTok video or Instagram Reel URL."
+      error:
+        "Provide a public TikTok or Instagram video URL.",
     });
   }
 
-  if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
-    return res.status(429).json({ success: false, error: "A download is already running. Try again shortly." });
+  if (!isValidVideoPage(url, platform)) {
+    return res.status(400).json({
+      success: false,
+      platform,
+      error: "The URL is not a supported video page.",
+    });
   }
-
-  activeDownloads++;
-  const id = crypto.randomBytes(12).toString("hex");
-  const outputTemplate = path.join(DOWNLOAD_DIR, id + ".%(ext)s");
 
   try {
-    await youtubedl(validated.url, {
-      noPlaylist: true,
+    const info = await youtubedl(url, {
+      dumpSingleJson: true,
       noWarnings: true,
-      noProgress: true,
+      noCallHome: true,
+      noPlaylist: true,
       format: "best[ext=mp4]/best",
-      output: outputTemplate,
-      maxFilesize: "20M",
       socketTimeout: 20,
-      retries: 1
-    }, { timeout: 65000 });
-
-    const names = await fsp.readdir(DOWNLOAD_DIR);
-    const candidates = names.filter(name => name.startsWith(id + ".") && !name.endsWith(".part"));
-    if (!candidates.length) throw new Error("No downloadable video was produced.");
-
-    const filePath = path.join(DOWNLOAD_DIR, candidates[0]);
-    const stats = await fsp.stat(filePath);
-    if (!stats.isFile() || stats.size === 0) throw new Error("The downloaded file is empty.");
-    if (stats.size > MAX_VIDEO_BYTES) throw new Error("The video exceeds the 20 MB limit.");
-
-    const extension = path.extname(filePath).toLowerCase();
-    res.setHeader("Content-Length", stats.size);
-    res.setHeader("Content-Disposition", `attachment; filename="hahari-anime-edit${extension || ".mp4"}"`);
-    res.setHeader("Content-Type", extension === ".webm" ? "video/webm" : "video/mp4");
-
-    const stream = fs.createReadStream(filePath);
-    stream.on("error", error => {
-      console.error("Video stream error:", error.message);
-      if (!res.headersSent) res.status(500).json({ success: false, error: "Could not stream the downloaded video." });
-      else res.destroy(error);
+      retries: 1,
     });
-    stream.on("close", () => removeDownloadFiles(id));
-    res.on("close", () => removeDownloadFiles(id));
-    stream.pipe(res);
-  } catch (error) {
-    await removeDownloadFiles(id);
-    console.error("Download failed:", error.message);
-    if (!res.headersSent) {
-      res.status(502).json({
-        success: false,
-        platform: validated.platform,
-        error: "Download failed. The platform may block the server, the video may be private, or the video may be unavailable."
-      });
+
+    const downloadUrl = info.url;
+
+    if (!downloadUrl) {
+      throw new Error("No direct video URL returned");
     }
-  } finally {
-    activeDownloads--;
+
+    res.json({
+      success: true,
+      platform,
+      title: info.title || "Anime edit",
+      downloadUrl,
+      url: downloadUrl,
+      thumbnail: info.thumbnail || null,
+      duration: info.duration || null,
+    });
+  } catch (error) {
+    console.error("Download failed:", error.message);
+
+    res.status(502).json({
+      success: false,
+      platform,
+      error:
+        "Download failed. The platform may block the server, or the video may be private or unavailable.",
+    });
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("Hahari Anime Edit API running on port " + PORT);
+  console.log(`Hahari Anime Edit API listening on port ${PORT}`);
 });
