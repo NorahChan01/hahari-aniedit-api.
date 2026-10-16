@@ -2,35 +2,36 @@ const express = require("express");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+const TIMEOUT_MS = 12000;
+const MAX_RESULTS = 20;
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
-const TIMEOUT_MS = 7000;
-const MAX_RESULTS = 20;
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+  "AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Chrome/131.0.0.0 Safari/537.36";
 
-const SEARCH_SOURCES = [
-  {
-    name: "searx-tiekoetter",
-    url: "https://searx.tiekoetter.com/search",
-    format: "json",
-  },
-  {
-    name: "searx-sapt ime",
-    url: "https://search.sapti.me/search",
-    format: "json",
-  },
-  {
-    name: "google",
-    url: "https://www.google.com/search",
-    format: "html",
-  },
-  {
-    name: "bing",
-    url: "https://www.bing.com/search",
-    format: "html",
-  },
-];
+function normalizeEscapedText(text) {
+  return String(text || "")
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\u003A/gi, ":")
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+}
+
+function cleanText(text = "") {
+  return normalizeEscapedText(text)
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function platformOf(rawUrl) {
   try {
@@ -56,9 +57,7 @@ function isVideoUrl(rawUrl, platform) {
     const url = new URL(rawUrl);
     const host = url.hostname.toLowerCase();
 
-    if (!["https:", "http:"].includes(url.protocol)) {
-      return false;
-    }
+    if (!["https:", "http:"].includes(url.protocol)) return false;
 
     if (platform === "tiktok") {
       return (
@@ -85,13 +84,11 @@ function normalizeUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
 
-    if (!["https:", "http:"].includes(url.protocol)) {
-      return null;
-    }
+    if (!["http:", "https:"].includes(url.protocol)) return null;
 
+    url.hostname = url.hostname.toLowerCase();
     url.search = "";
     url.hash = "";
-    url.hostname = url.hostname.toLowerCase();
 
     return url.href.replace(/\/$/, "");
   } catch {
@@ -99,46 +96,25 @@ function normalizeUrl(rawUrl) {
   }
 }
 
-function decodeHtml(value = "") {
-  return String(value)
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#(\d+);/g, (_, n) =>
-      String.fromCodePoint(Number(n))
-    )
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) =>
-      String.fromCodePoint(parseInt(n, 16))
-    );
-}
-
-function cleanText(value = "") {
-  return decodeHtml(String(value))
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-async function fetchText(url) {
+async function fetchPage(url) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timeout = setTimeout(
+    () => controller.abort(),
+    TIMEOUT_MS
+  );
 
   try {
     const response = await fetch(url, {
-      signal: controller.signal,
+      method: "GET",
       redirect: "follow",
+      signal: controller.signal,
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-          "AppleWebKit/537.36 (KHTML, like Gecko) " +
-          "Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent": USER_AGENT,
         Accept:
-          "application/json,text/html,application/xhtml+xml,*/*;q=0.8",
+          "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        Referer: new URL(url).origin + "/",
       },
     });
 
@@ -146,59 +122,51 @@ async function fetchText(url) {
       throw new Error(`HTTP ${response.status}`);
     }
 
-    return await response.text();
+    const text = await response.text();
+
+    if (
+      /verify you are human|unusual traffic|access denied|captcha/i.test(
+        text.slice(0, 20000)
+      )
+    ) {
+      throw new Error("Platform blocked or challenged this request");
+    }
+
+    return text;
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("Request timed out");
+    }
+
+    throw error;
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timeout);
   }
 }
 
-function extractHtmlLinks(html, platform) {
+function extractLinks(page, platform) {
+  const text = normalizeEscapedText(page);
   const results = [];
   const seen = new Set();
 
-  const matches = html.matchAll(
-    /\bhref\s*=\s*["']([^"']+)["']/gi
-  );
+  // Find complete URLs embedded in HTML and page JSON.
+  const urlPattern =
+    /https?:\/\/(?:www\.|m\.|vm\.|vt\.)?(?:tiktok\.com|instagram\.com)\/[^\s"'<>\\]+/gi;
 
-  for (const match of matches) {
-    let raw = decodeHtml(match[1]);
+  for (const match of text.matchAll(urlPattern)) {
+    let rawUrl = match[0].replace(/[),.;]+$/, "");
 
     try {
-      if (raw.startsWith("//")) {
-        raw = "https:" + raw;
-      }
+      rawUrl = decodeURIComponent(rawUrl);
+    } catch {}
 
-      const parsed = new URL(raw, "https://www.google.com");
-
-      if (
-        parsed.hostname.includes("google.com") &&
-        parsed.pathname === "/url"
-      ) {
-        raw =
-          parsed.searchParams.get("q") ||
-          parsed.searchParams.get("url") ||
-          raw;
-      } else if (
-        parsed.hostname.includes("bing.com") &&
-        parsed.pathname === "/ck/a"
-      ) {
-        const encoded = parsed.searchParams.get("u");
-
-        if (encoded?.startsWith("a1")) {
-          raw = Buffer.from(encoded.slice(2), "base64").toString();
-        }
-      }
-    } catch {
-      continue;
-    }
-
-    const actualPlatform = platformOf(raw);
+    const actualPlatform = platformOf(rawUrl);
 
     if (!actualPlatform) continue;
     if (platform !== "all" && actualPlatform !== platform) continue;
-    if (!isVideoUrl(raw, actualPlatform)) continue;
+    if (!isVideoUrl(rawUrl, actualPlatform)) continue;
 
-    const url = normalizeUrl(raw);
+    const url = normalizeUrl(rawUrl);
 
     if (!url || seen.has(url)) continue;
 
@@ -219,68 +187,34 @@ function extractHtmlLinks(html, platform) {
   return results;
 }
 
-function extractJsonResults(data, platform) {
-  const items = Array.isArray(data.results) ? data.results : [];
-  const results = [];
+function makeSearchUrl(platform, query) {
+  if (platform === "tiktok") {
+    return (
+      "https://www.tiktok.com/search/video?q=" +
+      encodeURIComponent(query)
+    );
+  }
 
-  for (const item of items) {
-    const rawUrl = item.url || item.link;
+  // Instagram's public keyword page; availability varies.
+  return (
+    "https://www.instagram.com/popular/" +
+    encodeURIComponent(query) +
+    "/"
+  );
+}
 
-    if (!rawUrl) continue;
+async function searchPlatform(query, platform) {
+  const url = makeSearchUrl(platform, query);
+  const page = await fetchPage(url);
+  const results = extractLinks(page, platform);
 
-    const actualPlatform = platformOf(rawUrl);
-
-    if (!actualPlatform) continue;
-    if (platform !== "all" && actualPlatform !== platform) continue;
-    if (!isVideoUrl(rawUrl, actualPlatform)) continue;
-
-    const url = normalizeUrl(rawUrl);
-
-    if (!url) continue;
-
-    results.push({
-      title: cleanText(item.title || "Anime edit").slice(0, 250),
-      url,
-      platform: actualPlatform,
-      description: cleanText(
-        item.content || item.description || ""
-      ).slice(0, 500),
-    });
+  if (results.length === 0) {
+    throw new Error(
+      "Page loaded but contained no extractable public video links"
+    );
   }
 
   return results;
-}
-
-async function searchSource(engine, query, platform) {
-  const siteQuery =
-    platform === "all"
-      ? `(site:tiktok.com OR site:instagram.com) "${query}" anime edit`
-      : `site:${platform}.com "${query}" anime edit`;
-
-  const url = new URL(engine.url);
-  url.searchParams.set("q", siteQuery);
-
-  if (engine.format === "json") {
-    url.searchParams.set("format", "json");
-    url.searchParams.set("language", "en");
-    url.searchParams.set("safesearch", "0");
-  }
-
-  const body = await fetchText(url.href);
-
-  if (engine.format === "json") {
-    let data;
-
-    try {
-      data = JSON.parse(body);
-    } catch {
-      throw new Error("Search source returned invalid JSON");
-    }
-
-    return extractJsonResults(data, platform);
-  }
-
-  return extractHtmlLinks(body, platform);
 }
 
 app.get("/", (req, res) => {
@@ -309,47 +243,47 @@ app.get("/api/search", async (req, res) => {
   if (query.length > 150) {
     return res.status(400).json({
       success: false,
-      error: "Query must be 150 characters or fewer.",
+      error: "Query must be 150 characters or fewer",
     });
   }
 
   if (!["all", "tiktok", "instagram"].includes(source)) {
     return res.status(400).json({
       success: false,
-      error: "source must be tiktok, instagram, or all.",
+      error: "source must be tiktok, instagram, or all",
     });
   }
 
-  const attempts = await Promise.allSettled(
-    SEARCH_SOURCES.map(async (engine) => ({
-      engine: engine.name,
-      items: await searchSource(engine, query, source),
+  const platforms =
+    source === "all" ? ["tiktok", "instagram"] : [source];
+
+  const settled = await Promise.allSettled(
+    platforms.map(async (platform) => ({
+      platform,
+      results: await searchPlatform(query, platform),
     }))
   );
 
   const results = [];
-  const seen = new Set();
   const errors = [];
+  const seen = new Set();
 
-  for (let i = 0; i < attempts.length; i++) {
-    const attempt = attempts[i];
-    const engine = SEARCH_SOURCES[i].name;
+  for (let i = 0; i < settled.length; i++) {
+    const result = settled[i];
+    const platform = platforms[i];
 
-    if (attempt.status === "rejected") {
+    if (result.status === "rejected") {
       errors.push({
-        engine,
-        error:
-          attempt.reason?.name === "AbortError"
-            ? "Request timed out"
-            : String(
-                attempt.reason?.message || "Search failed"
-              ),
+        platform,
+        error: String(
+          result.reason?.message || "Search failed"
+        ),
       });
       continue;
     }
 
-    for (const item of attempt.value.items) {
-      if (!item.url || seen.has(item.url)) continue;
+    for (const item of result.value.results) {
+      if (seen.has(item.url)) continue;
 
       seen.add(item.url);
       results.push(item);
@@ -360,25 +294,23 @@ app.get("/api/search", async (req, res) => {
     success: results.length > 0,
     query,
     source,
-    count: Math.min(results.length, MAX_RESULTS),
+    count: results.length,
     results: results.slice(0, MAX_RESULTS),
     errors,
     note:
       results.length > 0
-        ? "Search completed."
-        : "No matching public video links found. Check errors; public search services may be blocked or unavailable.",
+        ? "Search completed"
+        : "No video links extracted. Check the platform errors; direct search may be blocked or unavailable.",
   });
 });
 
 app.use((req, res) => {
   res.status(404).json({
     success: false,
-    error: "Endpoint not found.",
+    error: "Endpoint not found",
   });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `Hahari Anime Edit Search API running on port ${PORT}`
-  );
+  console.log(`Hahari Anime Edit Search API listening on ${PORT}`);
 });
